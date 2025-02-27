@@ -1,0 +1,27 @@
+<launch>
+    <!-- Nodelet Manager -->
+    <node pkg="nodelet" type="nodelet" name="nodelet_manager" args="manager" />
+
+
+    <!-- Point Cloud Generation Nodelet -->
+    <node pkg="nodelet" type="nodelet" name="nodelet1"
+        args="load depth_image_proc/point_cloud_xyz nodelet_manager">
+        <remap from="camera_info" to="/realsense/depth/camera_info"/>
+        <remap from="image_rect" to="/realsense/depth/image"/>
+        <remap from="points" to="/camera/depth/points"/>
+    </node>
+
+    <!--- Lantern Detection -->
+    <node name="lantern_detection" pkg="perception" type="lantern_detection" output="screen" clear_params = "true">
+        <rosparam command="load" file="$(find perception)/config/perception_config.yaml"/>
+    </node>
+
+    <!--- Map Filter -->
+    <node name="map_filter" pkg="perception" type="map_filter" output="screen" clear_params = "true"></node>
+
+    <!-- Junction Detection Node -->
+    <node name="junction_detection" pkg="perception" type="junction_detection.py" output="screen">
+        <rosparam command="load" file="$(find perception)/config/perception_config.yaml"/>
+    </node>
+
+</launch>
