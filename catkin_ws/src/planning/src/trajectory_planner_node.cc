@@ -3,28 +3,30 @@
 #include "ros/package.h"
 #include "yaml-cpp/yaml.h"
 
-TrajectoryPlanner::TrajectoryPlanner() : max_v_(5),
-                                         max_a_(2),
-                                         current_velocity_(Eigen::Vector3d::Zero()),
-                                         current_pose_(Eigen::Affine3d::Identity())
-{
+TrajectoryPlanner::TrajectoryPlanner() :
+        max_v_(5),
+        max_a_(2),
+        current_velocity_(Eigen::Vector3d::Zero()),
+        current_pose_(Eigen::Affine3d::Identity())
+        {
 
-    nh_.getParam("/trajectory_planner/dynamic_params/max_v", max_v_);
-    nh_.getParam("/trajectory_planner/dynamic_params/max_a", max_a_);
+    nh_.getParam("dynamic_params/max_v", max_v_);
+    nh_.getParam("dynamic_params/max_a", max_a_);
 
     // publisher
-    pub_markers_ = nh_.advertise<visualization_msgs::MarkerArray>("trajectory_markers", 0);
-    pub_trajectory_ = nh_.advertise<mav_planning_msgs::PolynomialTrajectory4D>("trajectory", 0);
+    pub_markers_ = nh_.advertise<visualization_msgs::MarkerArray>("trajectory_markers", 1);
+    pub_trajectory_ = nh_.advertise<mav_planning_msgs::PolynomialTrajectory4D>("trajectory", 1);
 
     // subscriber
     sub_max_speed_ = nh_.subscribe("/max_speed", 1, &TrajectoryPlanner::setMaxSpeed, this);
     sub_global_path_ = nh_.subscribe("/global_path", 1, &TrajectoryPlanner::planTrajectory, this);
+    sub_planned_path_ = nh_.subscribe("/planned_path", 1, &TrajectoryPlanner::planTrajectoryInsideCave, this);
     sub_odom_ = nh_.subscribe("/current_state_est", 1, &TrajectoryPlanner::uavOdomCallback, this);
+
 }
 
 // Callback to get current Pose of UAV
-void TrajectoryPlanner::uavOdomCallback(const nav_msgs::Odometry::ConstPtr &odom)
-{
+void TrajectoryPlanner::uavOdomCallback(const nav_msgs::Odometry::ConstPtr& odom) {
 
     // store current position in our planner
     tf::poseMsgToEigen(odom->pose.pose, current_pose_);
@@ -34,16 +36,14 @@ void TrajectoryPlanner::uavOdomCallback(const nav_msgs::Odometry::ConstPtr &odom
 }
 
 // Method to set maximum speed.
-void TrajectoryPlanner::setMaxSpeed(const std_msgs::Float32::ConstPtr &msg)
-{
+void TrajectoryPlanner::setMaxSpeed(const std_msgs::Float32::ConstPtr& msg) {
     max_v_ = msg->data;
     ROS_INFO("Updated max speed to: %f", max_v_);
 }
 
 // Plans a trajectory from the current position to the a goal position and velocity
 // we neglect attitude here for simplicity
-void TrajectoryPlanner::planTrajectory(const fla_msgs::GlobalPath::ConstPtr &globalPath)
-{
+void TrajectoryPlanner::planTrajectory(const fla_msgs::GlobalPath::ConstPtr& globalPath) {
 
     // 3 Dimensional trajectory => through carteisan space, no orientation
     const int dimension = 4;
@@ -53,12 +53,13 @@ void TrajectoryPlanner::planTrajectory(const fla_msgs::GlobalPath::ConstPtr &glo
 
     // Optimze up to 4th order derivative (SNAP)
     const int derivative_to_optimize =
-        mav_trajectory_generation::derivative_order::SNAP;
+            mav_trajectory_generation::derivative_order::SNAP;
 
     // we have 2 vertices:
     // Start = current position
     // end = desired position and velocity
     mav_trajectory_generation::Vertex start(dimension), middle(dimension);
+
 
     /******* Configure start point *******/
     // set start point constraints to current position and set all derivatives to zero
@@ -80,17 +81,20 @@ void TrajectoryPlanner::planTrajectory(const fla_msgs::GlobalPath::ConstPtr &glo
     /******* Configure trajectory *******/
     auto points = globalPath->points;
 
-    for (size_t i = 0; i < points.size(); ++i)
-    {
+
+    for (size_t i = 0; i < points.size(); ++i) {
+        double prev_yaw = 0.0;
+        if (i == 0) {
+            prev_yaw = start_pos_4d(3);
+        } else {
+            prev_yaw = points[i - 1].orientation;
+        }
         Eigen::Vector4d pos;
         //  minimize angle difference to avoid 360m degree spin
-        double diff = start_pos_4d(3) - points[i].orientation;
-        if (diff > M_PI)
-        {
+        double diff = prev_yaw - points[i].orientation;
+        if (diff > M_PI) {
             points[i].orientation = points[i].orientation + 2 * M_PI;
-        }
-        else if (diff < -M_PI)
-        {
+        } else if (diff < -M_PI) {
             points[i].orientation = points[i].orientation - 2 * M_PI;
         }
 
@@ -98,18 +102,15 @@ void TrajectoryPlanner::planTrajectory(const fla_msgs::GlobalPath::ConstPtr &glo
         double vel = points[i].velocity;
         double acc = points[i].acceleration;
         // Check if it's the last element
-        if (i < points.size() - 1)
-        {
+        if (i < points.size() - 1) {
             middle.addConstraint(mav_trajectory_generation::derivative_order::POSITION, pos);
-            if (vel == 0)
-            {
+            if (vel == 0) {
                 Eigen::Vector4d vel_vec;
                 vel_vec << 0.0, 0.0, 0.0, 0.0;
                 middle.addConstraint(mav_trajectory_generation::derivative_order::VELOCITY, vel_vec);
             }
 
-            if (acc == 0)
-            {
+            if (acc == 0) {
                 Eigen::Vector4d acc_vec;
                 acc_vec << 0.0, 0.0, 0.0, 0.0;
                 middle.addConstraint(mav_trajectory_generation::derivative_order::ACCELERATION, acc_vec);
@@ -117,25 +118,21 @@ void TrajectoryPlanner::planTrajectory(const fla_msgs::GlobalPath::ConstPtr &glo
 
             vertices.push_back(middle);
 
-            if (vel == 0)
-            {
+            if (vel == 0) {
                 middle.removeConstraint(mav_trajectory_generation::derivative_order::VELOCITY);
             }
-            if (acc == 0)
-            {
+            if (acc == 0) {
                 middle.removeConstraint(mav_trajectory_generation::derivative_order::ACCELERATION);
             }
-        }
-        else
-        {
+        } else {
             /******* Configure end point *******/
             // set end point constraints to desired position and set all derivatives to zero
             middle.makeStartOrEnd(pos,
-                                  derivative_to_optimize);
+                               derivative_to_optimize);
             Eigen::Vector4d vel_vec;
             vel_vec << 0.0, 0.0, 0.0, 0.0;
             middle.addConstraint(mav_trajectory_generation::derivative_order::VELOCITY,
-                                 vel_vec);
+                              vel_vec);
             vertices.push_back(middle);
         }
     }
@@ -168,10 +165,108 @@ void TrajectoryPlanner::planTrajectory(const fla_msgs::GlobalPath::ConstPtr &glo
     mav_trajectory_generation::Trajectory trajectory;
     opt.getTrajectory(&trajectory);
     publishTrajectory(trajectory);
+
 }
 
-bool TrajectoryPlanner::publishTrajectory(const mav_trajectory_generation::Trajectory &trajectory)
-{
+void TrajectoryPlanner::planTrajectoryInsideCave(const nav_msgs::Path::ConstPtr& plannedPath) {
+
+    // ROS_INFO("Planning trajectory inside cave");
+     // 3 Dimensional trajectory => through carteisan space, no orientation
+    const int dimension = 3;
+
+    // Array for all waypoints and their constrains
+    mav_trajectory_generation::Vertex::Vector vertices;
+
+    // Optimze up to 4th order derivative (SNAP)
+    const int derivative_to_optimize =
+            mav_trajectory_generation::derivative_order::SNAP;
+
+    // we have 2 vertices:
+    // Start = current position
+    // end = desired position and velocity
+    mav_trajectory_generation::Vertex start(dimension), middle(dimension), end(dimension);
+
+
+    /******* Configure start point *******/
+    // set start point constraints to current position and set all derivatives to zero
+    start.makeStartOrEnd(current_pose_.translation(),
+                         derivative_to_optimize);
+
+    // set start point's velocity to be constrained to current velocity
+    start.addConstraint(mav_trajectory_generation::derivative_order::VELOCITY,
+                        current_velocity_);
+
+    // add waypoint to list
+    vertices.push_back(start);
+
+    /******* Configure middle points *******/
+    Eigen::Vector3d middle_position;
+
+    auto points = plannedPath->poses;
+
+    for (size_t i = 0; i < points.size() - 1; ++i) {
+        // Extract position
+        middle_position << points[i].pose.position.x,
+                        points[i].pose.position.y,
+                        points[i].pose.position.z;
+
+        // Add constraint
+        middle.addConstraint(mav_trajectory_generation::derivative_order::POSITION, middle_position);
+
+        // Append
+        vertices.push_back(middle);
+        
+        // Clear constraints
+        middle.removeConstraint(mav_trajectory_generation::derivative_order::POSITION);
+        middle.removeConstraint(mav_trajectory_generation::derivative_order::VELOCITY);
+        middle.removeConstraint(mav_trajectory_generation::derivative_order::ACCELERATION);
+    }
+
+    // ROS_INFO("Vertices size: %lu", vertices.size());
+
+    /******* Configure end point *******/
+    // set end point constraints to desired position and set all derivatives to zero
+    end.makeStartOrEnd(Eigen::Vector3d(points.back().pose.position.x,
+                                        points.back().pose.position.y,
+                                        points.back().pose.position.z),
+                       derivative_to_optimize);
+
+    // set start point's velocity to be constrained to current velocity
+    end.addConstraint(mav_trajectory_generation::derivative_order::VELOCITY,
+                      Eigen::Vector3d::Zero());
+
+    // add waypoint to list
+    vertices.push_back(end);
+
+    // setimate initial segment times
+    std::vector<double> segment_times;
+    segment_times = estimateSegmentTimes(vertices, max_v_, max_a_);
+
+    // Set up polynomial solver with default params
+    mav_trajectory_generation::NonlinearOptimizationParameters parameters;
+
+    // set up optimization problem
+    const int N = 10;
+    mav_trajectory_generation::PolynomialOptimizationNonLinear<N> opt(dimension, parameters);
+    opt.setupFromVertices(vertices, segment_times, derivative_to_optimize);
+
+    // constrain velocity and acceleration
+    opt.addMaximumMagnitudeConstraint(mav_trajectory_generation::derivative_order::VELOCITY, max_v_);
+    opt.addMaximumMagnitudeConstraint(mav_trajectory_generation::derivative_order::ACCELERATION, max_a_);
+
+    // solve trajectory
+    opt.optimize();
+
+    // ROS_INFO("Optimization done");
+
+    // get trajectory as polynomial parameters
+    mav_trajectory_generation::Trajectory trajectory;
+    opt.getTrajectory(&trajectory);
+    publishTrajectory(trajectory);
+
+}
+
+bool TrajectoryPlanner::publishTrajectory(const mav_trajectory_generation::Trajectory& trajectory){
     // send trajectory as markers to display them in RVIZ
     visualization_msgs::MarkerArray markers;
     double distance = 0.2; // Distance by which to separate additional markers. Set 0.0 to disable.
@@ -189,8 +284,7 @@ bool TrajectoryPlanner::publishTrajectory(const mav_trajectory_generation::Traje
     return true;
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char** argv){
     ros::init(argc, argv, "trajectory_planner_node");
     ROS_INFO_NAMED("trajectory_planner", "Trajectory Planner started!");
     TrajectoryPlanner n;
